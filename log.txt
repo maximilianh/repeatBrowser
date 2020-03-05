@@ -1,0 +1,3 @@
+hgsql hg38 -NB -e 'select distinct repName, repClass from rmskHmmer2020' > tmp/repClass.tsv
+for i in hg38/seqs/byName/*.fa; do echo $i; faToNib $i hg38/seqs/nib/`basename $i .fa`.nib; done
+pslToPslx lift/hg38_to_hg38reps.over.psl /gbdb/hg38/hg38.2bit hg38/seqs/seqs.2bit temp/over.pslx

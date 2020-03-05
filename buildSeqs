@@ -1,0 +1,1029 @@
+#!/usr/bin/env python
+# builds the consensus sequences from the repeatmasker annotations for a given genome database
+
+# todo one day: a simple pipeline system
+# - an OrderedDict of stepNames to functions
+# - a system to clean/init directories
+# - a system to run a list of functions, local, multithreaded or on parasol
+# - a system to log important tracking data (lengths, stats, ...)
+# - auto-config: define function s_name with comment sss will automatically add this function
+
+from os.path import *
+import collections, os, sys, glob, re, textwrap, operator, json
+from collections import defaultdict
+
+#sys.path.append(dirname(__file__)+"/lib")
+#from peakdetect import peakdet
+
+# biopython
+from Bio import AlignIO
+from Bio.Align import AlignInfo
+
+from config import *
+
+def cleanDirs(dirs):
+    print(("cleaning dirs: %s" % (dirs)))
+    for d in dirs:
+        runCmd("rm -rf %s" % d)
+        os.makedirs(d)
+
+# ----- MAIN -----
+
+outDir = DB+"/seqs"
+allBedDir = join(outDir, "allBed")
+topBedDir = join(outDir, "topBed")
+topFaDir = join(outDir, "topSeqs")
+statsDir = join(outDir, "stats")
+alnDir = join(outDir, "aln")
+consDir = join(outDir, "cons")
+prettyAlnDir = join(outDir, "prettyAln")
+htmlDir = join(outDir, "html")
+lenDir = join(outDir, "len")
+byNameDir = join(outDir, "byName")
+
+dataDir = "data"
+dfamTsv = join(dataDir,"dfam.tsv")
+
+sizeDir = join(outDir, "sizes")
+histDir = join("fig", "hist")
+
+# cat
+repSizesFname = join(outDir, "chrom.sizes")
+
+# blat-prep
+blatBedGenomeDir = join(outDir, "blatGenomeBed")
+blatFaGenomeDir = join(outDir, "blatGenomeFa")
+
+# blat
+pslDir = join(outDir, "psl")
+liftPslDir = join(outDir, "pslLift")
+bestLiftPslDir = join(outDir, "pslLiftBest")
+chainDir = join(outDir, "chain")
+
+# fa-strand
+strandFaDir = join(outDir, "blatGenomeFaStrand")
+strandBedDir = join(outDir, "blatGenomeBedMinCov")
+
+
+# blat-cat, final output directory of all liftOver files, does not depend on DB
+liftDir = "lift"
+liftBaseName = DB+"_to_"+DB+"reps"
+
+# track files for the hub
+hubDir = "hub"
+repTrackDir = join(hubDir, DB+"reps")
+
+featbitsDir = join(outDir, "featbits")
+
+allSteps = ["rmsk", "dfam", "allbed", \
+    "cons-list", "cons-prep", "cons-aln", "cons-flatten", "fasta", # consensus building
+     "blat-prep", "blat", "blat-cat", "blat-rawbest", "blat-rawbest-cat",
+    "rmsk-cov", "strand-fa", "summary",
+    "t-build", "t-liftcov"]
+plotSteps = ["classHist", "hist"]
+
+steps = []
+if len(sys.argv)>1:
+    steps = sys.argv[1].split(",")
+
+if steps!=["all"] and (len(sys.argv)==1 or len(set(steps) - set(allSteps)-set(plotSteps))!=0):
+    print(("possible steps: %s" % ",".join(allSteps)))
+    #print("init - create/zap all build directories")
+    print("rmsk - dump the rmsk table (see config.py)")
+    print("dfam - parse DFAM to something smaller")
+    print("allbed - create BED files, one per rmsk name")
+    print("cons-list - make list of rmsk names that we need to build a consensus for")
+    print("cons-prep - make a bed file for the longest copies of the repeats in cons-list")
+    print("cons-aln - align the longest copies")
+    print("cons-flatten - create single consensus for each alignment")
+    #print("top50 - get "+str(TARGETPERC)+"\% percentile top50 sequences for every non-dfam repeat")
+    #print("aln - align sequence at positions in genome with muscle")
+    print("fasta - combine sequences from DFAM, from cons-flatten and manual sequences into a single file")
+    print("blat-prep - prepare input files for blat")
+    print("blat - run blat of seqs.fa against genome")
+    print("blat-cat - create chain file from blat jobs")
+    print("hist - plot histograms of lengths")
+    print("or simply:")
+    print("all - run all steps")
+    sys.exit(0)
+
+if steps==["all"]:
+    steps = allSteps
+
+if steps==["plotSteps"]:
+    steps = plotSteps
+
+#if "init" in steps:
+    #if isdir(outDir):
+        #runCmd("rm -rf %s" % outDir)
+    #dirs = [allBedDir, topBedDir, faDir, alnDir, consDir, lenDir, prettyAlnDir, htmlDir, "fig"]
+    #for d in dirs:
+        #print(("mkdir %s" % d))
+        #os.makedirs(d)
+
+if not isdir(statsDir):
+    os.makedirs(statsDir)
+
+# ========
+if "dfam" in steps:
+    from Bio import SeqIO
+    import gzip
+    seqs = {}
+    for rec in SeqIO.parse(gzip.open("data/Dfam.embl.gz", "rt"), "embl"):
+        seqs[rec.id.split(".")[0]] = rec.seq # remove .x version identifier that biopy invented
+
+    # biopython is unable to get the NM attribute
+    nm = None
+    names = {}
+    repType = ""
+    repClass = ""
+    org = ""
+    ccs = []
+    commentEnd = False
+    kws = []
+    for line in gzip.open("data/Dfam.embl.gz", "rt"):
+        if line.startswith("CC        Type:"):
+            repType = line.strip().split("CC        Type:")[1].strip()
+        if line.startswith("CC        SubType:"):
+            repClass = line.strip().split("CC        SubType:")[1].strip()
+        if line.startswith("CC        Species:"):
+            org = line.strip().split("CC        Species:")[1].strip()
+        if line.startswith("KW   "):
+            kws.append(line.strip().replace("KW   ",""))
+        if line.startswith("CC   ") and not commentEnd:
+            #print("XX", ccs)
+            ccs.append(line.strip().replace("CC   ",""))
+        if line=="CC\n":
+            commmentEnd = True
+        if line.startswith("NM "):
+            nm = line.split()[1].split(";")[0]
+
+        if line.startswith("ID "):
+            seqId = line.split()[1].split(";")[0]
+            ccs = []
+
+        if line.startswith("//"):
+            if nm is None:
+                print("first ID line")
+                continue
+            # a few times, the comments start with a reference -> skip all of it
+            if ccs[0][0]=="[" or ccs[0][0].startswith("RepeatMasker Annotations"):
+                ccs = []
+            names[seqId] = (nm, repType, repClass, org, " ".join(kws)+" - "+" ".join(ccs))
+            repType = ""
+            repClass = ""
+            ccs = []
+            kws = []
+            commentEnd = False
+
+    ofh = open(dfamTsv, "w")
+    ofh.write("repName\ttype\tclass\torg\tcomment\tseq\n")
+    for seqId, seq in seqs.items():
+        repName, repType, repClass, org, comment = names[seqId]
+        row = [repName, repType, repClass, org, comment, str(seq)]
+        ofh.write("\t".join(row))
+        ofh.write("\n")
+    ofh.close()
+    print("Wrote %s" % ofh.name)
+
+def runCmd(cmd):
+    print("exec: "+cmd)
+    ret = os.system(cmd)
+    if ret != 0:
+        print("Could not run: %s" % cmd)
+        sys.exit(1)
+
+
+
+# ===========
+
+if "rmsk" in steps:
+    #cmd = '''hgsql %s -NB -e "select distinct repName from %s where repClass not in ('Low_complexity', 'Satellite', 'Simple_repeat')" > seqs/repnames.txt''' % (DB, rmskTable)
+    ##cmd = '''hgsql %s -NB -e "select distinct repName from %s where repClass not in ('Low_complexity', 'Satellite', 'Simple_repeat', 'rRNA', 'scRNA', 'snRNA', 'srpRNA', 'tRNA')" > seqs/repnames.txt''' % (DB, rmskTable)
+    #print("wrote target repeat names to seqs/repnames.txt")
+    #runCmd(cmd)
+    print("dumping the rmsk table")
+    outFname = join(outDir, "rmsk.tsv")
+    cmd = '''hgsql %s -NB -e "select * from %s where repClass not in ('Low_complexity', 'Satellite', 'Simple_repeat') and not genoName like '%%hap%%' and genoName not like '%%random%%' and genoName not like '%%fix%%' and genoName not like '%%alt%%'" > %s''' % (DB, rmskTable, outFname)
+    runCmd(cmd)
+    print("wrote repeat masker table to %s" % outFname)
+
+# ===========
+
+def genomeToRam():
+    if not isfile("/dev/shm/%s.fa" % DB):
+        print("copying genome to ramdisk")
+        cmd = "cp data/%s.fa /dev/shm/" % DB
+        runCmd(cmd)
+
+def readDfamForce():
+    forceFname = "data/rmToDfam.tsv"
+    print ("Reading manual overrides %s" % forceFname)
+    dfamForce = {}
+    for line in open(forceFname):
+        row = line.rstrip("\n").split("\t")
+        rmName = row[0]
+        dfamNames = row[1:]
+        dfamNames = [x for x in dfamNames if x!=""]
+        if len(dfamNames)!=1:
+            print("rmName %s is forced to too many dfamNames, skipping" % rmName)
+            continue
+        for dfamName in dfamNames:
+            dfamForce[rmName] = dfamName
+    return dfamForce
+
+def readRmToDfam():
+    fname = RMTORB
+    print ("Reading  %s" % fname)
+    rmToRb = {}
+    for line in open(fname):
+        row = line.rstrip("\n").split("\t")
+        rmName = row[0]
+        rbName = row[1]
+        assert(rmName not in rmToRb)
+        rmToRb[rmName] = rbName
+    return rmToRb
+
+def readRbToRm():
+    fname = RBTORM
+    print ("Reading  %s" % fname)
+    rbToRm = defaultdict(list)
+    for line in open(fname):
+        row = line.rstrip("\n").split("\t")
+        rbName = row[0]
+        rmName = row[1]
+        rbToRm[rbName].append(rmName)
+    return rbToRm
+
+if "allbed" in steps:
+    cleanDirs([allBedDir, lenDir])
+    print ("loading dfam names")
+    print("Creating BED files from rmsk.tsv into %s" % allBedDir)
+    ifh = open(join(outDir, "rmsk.tsv"))
+    ofhs = {}
+    lens = defaultdict(list)
+    repCounts = defaultdict(int)
+    for line in ifh:
+        if line.startswith("#"):
+            continue
+        row = line.rstrip("\n").split("\t")
+        try:
+            binVal, swScore, milliDiv, milliDel, milliIns, genoName, genoStart, genoEnd, genoLeft, strand, repName, repClass, repFamily, repStart, repEnd, repLeft, repId = row
+        except:
+            print(row)
+            raise
+        
+        repCounts[repName] += 1
+
+        if not repName in ofhs:
+            fname = join(allBedDir, repName+".bed")
+            ofh = open(fname, "w")
+            ofhs[repName] = ofh
+
+        ofh = ofhs[repName]
+        newName = genoName+":"+genoStart+"-"+genoEnd+":"+strand
+        ofh.write("\t".join([genoName, genoStart, genoEnd, newName, "0", strand]))
+        ofh.write("\n")
+
+        repLen = int(genoEnd) - int(genoStart)
+        lens[repName].append(repLen)
+
+    for repName, lenList in lens.items():
+        ofh = open(join(outDir, "len/"+repName+".txt"), "w")
+        for l in lenList:
+            ofh.write("%d\n" % l)
+        ofh.close()
+
+    json.dump(repCounts, open(join(statsDir, "allbed.json"), "w"))
+    print("Wrote files to %s and %s" % (allBedDir, lenDir))
+
+# ========
+if "classHist" in steps:
+    # histograms of repeat lengths by class of repeat
+    import matplotlib.pyplot as plt
+    import matplotlib
+    import numpy as np
+    matplotlib.use('AGG')
+
+    import pandas as pd
+    rcDf = pd.read_table("tmp/repClass.tsv")
+    repToClass = rcDf.set_index("repName").to_dict()["repClass"]
+
+    allLens= []
+    l1Lens = []
+    classLens = collections.defaultdict(list)
+    for fname in glob.glob(lenDir+"/*.txt"):
+        #print(fname)
+        lens = open(fname).read().splitlines()
+        lens = [int(x) for x in lens]
+        repName = fname.split("/")[-1].split(".")[0]
+        repLen = np.percentile(lens, 90)
+        if  repName.startswith("L1"):
+            l1Lens.append(repLen)
+        else:
+            allLens.append(repLen)
+        className = repToClass[repName].replace("?","")
+        classLens[className].append(repLen)
+    print("Got %d sizes" % len(allLens))
+    print(classLens)
+
+    filtClassLens = {}
+    for className, lens in classLens.items():
+        if len(lens) > 5:
+            filtClassLens[className] = lens
+        else:
+            print("Not finding target len for %s, only %d repNames" % (className, len(lens)))
+
+    print("%d repeat classes left" % len(filtClassLens.keys()))
+
+    binSize=50
+    bins = np.arange(0, 5000, binSize)
+    binCount = 40
+    fig = plt.figure()
+    fig, axes = plt.subplots(len(filtClassLens))
+    fig.set_size_inches(8,20)
+    binCount = 35
+
+    for i, className, in enumerate(filtClassLens.keys()):
+        lens = filtClassLens[className]
+        ax = axes[i]
+        histVals, bins, patches = ax.hist(lens, binCount, facecolor='g', alpha=0.75)
+        ax.set_title("class %s: 90th percentile of lengths, %d repeat types" % (className, len(lens)))
+
+    fname = "fig/classHisto.png"
+    plt.savefig(fname)
+    print("Wrote %s" %fname)
+
+if "hist" in steps:
+    cleanDirs([histDir])
+
+    dfamData = {}
+    for line in open(dfamTsv):
+        row = line.rstrip("\n").split("\t")[:5]
+        repName, repType, repClass, org, comment = row
+        dfamData[repName] = (repType, repClass, org, comment)
+
+    import matplotlib.pyplot as plt
+    import matplotlib
+    from scipy.signal import find_peaks_cwt
+    matplotlib.use('AGG')
+    import numpy as np
+    for fname in glob.glob(lenDir+"/*.txt"):
+        repName = fname.split("/")[-1].split(".")[0]
+        #if repName not in ["MLT1F1", "L1PA5"]:
+            #continue
+        lens = open(fname).read().splitlines()
+        lens = np.array([float(x) for x in lens])
+
+        fig, ax1 = plt.subplots()
+        plt.hist(lens, 50)
+        #peaks = find_peaks(lens, height=50, threshold=100, distance=200, prominence=100, width=50, 
+                #print
+        #widths = [20, 50, 100]
+        #peaks = find_peaks_cwt(lens, widths)
+        #print(histVals)
+        #delta = len(lens) / 3
+        #delta = 5.0
+        #delta = 5
+        #print(histVals)
+        #peaks, mins = peakdet(histVals, delta)
+        percLen = np.percentile(lens, TARGETPERC)
+        #print("Peaks: "+repr(peaks))
+        #print("Peaks: "+repr(peaks)+", Values: "+repr(values))
+        yMid = int(ax1.get_ylim()[1]*0.5)
+        #if len(peaks)>0:
+            #for row in peaks:
+                #binIdx,y = row
+                #print("binIdx, y", binIdx, y)
+                #x = bins[int(binIdx)]
+                #print("Peak at "+str(x))
+                #ax1.axvline(x, color="blue", label="peakdet")
+                #ax1.text(x,yMid,"peakdet",rotation=90, horizontalalignment="left")
+
+        fig.suptitle(repName)
+        if repName in dfamData:
+            dfam = dfamData[repName]
+            ax1.set_title(dfam[0] + " - "+dfam[1])
+        ax1.axvline(percLen, color="black")
+        ax1.text(percLen,yMid,str(TARGETPERC)+"th percentile",rotation=90, horizontalalignment="left")
+
+        perc80Len = np.percentile(lens, 90)
+        ax1.axvline(perc80Len, color="green")
+        ax1.text(perc80Len,yMid,"90th percentile",rotation=90, horizontalalignment="left")
+
+        fname = histDir+"/"+repName+".png"
+        plt.savefig(fname)
+        plt.close()
+        print("Wrote %s" %fname)
+
+
+# ======
+if "cons-list" in steps:
+    # make list of all rmsk names of which we need to build a consensus sequence for
+    import pandas as pd
+    print("reading dfam.tsv")
+    rcDf = pd.read_table(dfamTsv)
+    dfamSeqs = rcDf.set_index("repName").to_dict()["seq"]
+
+    dfamForce = readRmToDfam()
+    print("Manual assignments: %s" % dfamForce)
+
+    # all possible rmsk names
+    repCounts = json.load(open(join(statsDir, "allbed.json")))
+    doCons = []
+    for repName in repCounts:
+        if repName in dfamSeqs or repName in dfamForce or repName.replace("-int", "") in dfamSeqs:
+            print("%s: has DFAM sequence or is assigned or can be int-stripped" % repName)
+        else:
+            print("%s: need to build consensus" % repName)
+            doCons.append(repName)
+
+    statFname = join(outDir, "needCons.txt")
+    ofh = open(statFname, "w")
+    ofh.write("\n".join(doCons))
+    print("Wrote list of consensuses needed to %s" % ofh.name)
+
+# =======
+if "cons-prep" in steps:
+    # make top50 beds and fasta sequences
+    cleanDirs([topBedDir, topFaDir])
+    import numpy as np
+    repStats = defaultdict(dict)
+
+    todoNames = open(join(outDir, "needCons.txt")).read().splitlines()
+
+    for repName in todoNames:
+        lenFname = join(lenDir, repName+".txt")
+        lens = open(lenFname).read().splitlines()
+        lens = np.array([float(x) for x in lens])
+        targetLen = int(np.percentile(lens, TARGETPERC, interpolation="nearest"))
+        repStats[repName]["lens"] = list(lens)
+        repStats[repName]["targetLen"] = targetLen
+
+        bedFname = join(allBedDir, repName+".bed")
+        topBedName = join(topBedDir, repName+".bed")
+        print("reading %s and %s, writing %s, %d instances" % (lenFname, bedFname, topBedName, len(lens)))
+
+        beds = []
+        for line in open(bedFname):
+            row = line.rstrip("\n").split("\t")
+            #chr7    26687137        26687231        MER133A 0       -
+            #print(row)
+            chrom, start, end, name, score, strand = row
+            row[1] = int(row[1])
+            row[2] = int(row[2]) # for sorting later
+            bedLen = int(end)-int(start)
+            row.insert(0, bedLen)
+            beds.append(row)
+
+        beds.sort()
+
+        # search for the first bed with targetLen and take 50 beds before that, or if not enough
+        # simply the shortest 50 beds
+        topBeds = None
+        for i, bed in enumerate(beds):
+            bedLen = bed[0]
+            if bedLen == targetLen:
+                if i >= 50:
+                    topBeds = beds[i-50:i]
+                else:
+                    print("not enough sequences, using 50 shortest")
+                    topBeds = beds[0:50]
+                break
+        assert(topBeds is not None)
+
+        topBeds.sort() # sort by chrom position, faster retrieval
+
+        topLens = []
+        ofh = open(topBedName, "w")
+        for row in topBeds:
+            bedLen = row[0]
+            topLens.append(bedLen)
+            bed = [str(x) for x in row[1:]]
+            bed[3] = bed[0]+":"+bed[1]+"-"+bed[2] # need position for bedtools in name field, for fasta
+            ofh.write("\t".join(bed))
+            ofh.write("\n")
+        ofh.close()
+        print("topLengths: %s" % topLens)
+        repStats[repName]["topLens"] = topLens
+
+        print("Getting sequences")
+        faFname = join(topFaDir, repName+".fa")
+        cmd = "bedtools getfasta -fi data/%s.fa -bed seqs/topBed/%s.bed -s -fo %s" % (DB, repName, faFname)
+        runCmd(cmd)
+
+    json.dump(repStats, open(join(statsDir, "topbed.json"), "w"))
+
+# ========
+if "cons-aln" in steps:
+    cleanDirs([alnDir])
+    print(" = creating consensus seqs")
+    if CLUSTER:
+        jfh = open("jobList", "w")
+
+    for faName in glob.glob(join(topFaDir, "*.fa")):
+        consName = splitext(basename(faName))[0]
+        alnName = join(alnDir, consName+".aln")
+
+        #cmd = "mafft %s > %s" % (faName, alnFaName)
+        #cmd = "clustalw2 {check in exists %s} -ALIGN -OUTFILE={check out exists %s}\n" % (faName, alnName)
+        if CLUSTER:
+            cmd = "muscle -in {check in exists %s} -out {check out exists %s}\n" % (abspath(faName), abspath(alnName))
+            jfh.write(cmd)
+        else:
+            cmd = "muscle -in %s -out %s\n" % (abspath(faName), abspath(alnName))
+            runCmd(cmd)
+
+    if CLUSTER:
+        jfh.close()
+        cmd = "ssh %s 'cd %s; para resetCounts; para -maxJob=200 -batch=seqs make jobList'" % (CLUSTER, os.getcwd())
+        print(cmd)
+        runCmd(cmd)
+
+if "cons-flatten" in steps:
+    " flatten the alignments to a consensus sequence "
+    cleanDirs([consDir, prettyAlnDir])
+    statData = {}
+    for alnName in glob.glob(join(alnDir, "*.aln")):
+        consName = splitext(basename(alnName))[0]
+        print(("consensus of %s" % alnName))
+        alignment = AlignIO.read(alnName, "fasta")
+
+        summary_align = AlignInfo.SummaryInfo(alignment)
+        cons = summary_align.gap_consensus(threshold=0.05, ambiguous="N")
+        consAln = str(cons)
+        consSeq = str(cons).replace("-", "")
+        if len(consSeq)==0:
+            print(("cannot get consensus for %s" % alnName))
+            continue
+
+        alnLen = alignment.get_alignment_length()
+        seqLen = len(consSeq)
+        alnData = {}
+        alnData["alnLen"] = alnLen
+        alnData["consLen"] = alnLen
+        alnData["nCount"] = len(list(re.finditer("N", consSeq)))
+        alnData["ratio"] = float(alnLen)/seqLen
+
+        statData[consName] = alnData
+        consSeqWrap = "\n".join(textwrap.wrap(consSeq, 60))
+
+        consFname = join(consDir, consName+".fa")
+        consFh = open(consFname, "w")
+        consFh.write(">%s\n%s\n" % (consName, consSeqWrap))
+        consFh.close()
+
+        # create complete alignment with consensus as a .fa file
+        pretFaFname = join(prettyAlnDir, consName+".fa")
+        pretFh = open(pretFaFname, "w")
+        pretFh.write(">consensus:0-%d\n%s\n" % (len(str(cons)), str(cons)))
+        AlignIO.write(alignment, pretFh, "fasta")
+        pretFh.close()
+
+    json.dump(statData, open(join(statsDir, "cons.json"), "w"))
+
+if "fasta" in steps:
+    " create the repbrowser ref sequences, a mix of dfam, consensuses and manual additions "
+    cleanDirs([byNameDir])
+
+    rmskNames = json.load(open(join(statsDir, "allbed.json")))
+
+    dfamSeqs = {}
+    for line in open(dfamTsv):
+        row = line.rstrip("\n").split("\t")
+        dfamSeqs[row[0]] = row[-1]
+
+    rmToDfam = readRmToDfam()
+
+    ofh = open(outDir+"/seqs.fa", "w")
+    doneNames = set()
+    seqOrigin = defaultdict(list)
+    for repName in rmskNames:
+        how = "ident_name"
+
+        rmskName = repName
+
+        #  check if there is a manually assigned dfam sequence
+        if repName in rmToDfam:
+            print("%s: is manually assigned to DFAM, writing %s" % (repName, rmToDfam[repName]))
+            repName = rmToDfam[repName]
+            how = "hmmer/rmsk_correlation"
+
+        # check if we can do int-stripping to find a DFAM sequence
+        if repName not in dfamSeqs:
+            shortRepName = repName.replace("-int","")
+            if shortRepName in dfamSeqs:
+                print("%s is %s in DFAM" % (repName, shortRepName))
+                repName = shortRepName
+                how = "ident_name(-int)"
+
+        if repName in dfamSeqs:
+            seqOrigin[repName].append( (rmskName, how) )
+        else:
+            seqOrigin[repName].append( (rmskName, "top50consensus") )
+
+        # we write sequences only once
+        if repName in doneNames:
+            print("not writing %s, already done" % repName)
+            continue
+        doneNames.add(repName)
+
+        if repName in dfamSeqs:
+            print("%s: writing DFAM sequence" % repName)
+            ofh.write(">%s\n"% repName)
+            ofh.write("%s\n"% dfamSeqs[repName])
+        else:
+            print("%s: using top50 consensus" % repName)
+            faBlob = open(join(consDir, repName+".fa")).read()
+            ofh.write(faBlob)
+
+    if DB.startswith("hg"):
+        print("adding special cases from data/manualAdd to sequences")
+        ofh.write(open("data/manualAdd.fa").read())
+        seqOrigin["HERVK-full"] = [("HERVK-int", "manual"), ("LTR5_Hs", "manual"), ("LTR5A", "manual"), ("LTR5B", "manual"), ("LTR5", "manual")]
+        seqOrigin["HERVH-full"] = [("HERVH-int", "manual"), ("LTR7", "manual"), ("LTR7Y", "manual"), ("LTR7B", "manual"), ("LTR7C", "manual")]
+
+    ofh.close()
+    print("Wrote %s" % ofh.name)
+
+    cmd = "faSplit byname %s %s/" % (ofh.name, byNameDir)
+    runCmd(cmd)
+
+    cmd = 'faToTwoBit %s/seqs.fa %s/seqs.2bit' % (outDir, outDir)
+    runCmd(cmd)
+
+    cmd = 'faSize %s/seqs.fa -detailed > %s' % (outDir, repSizesFname)
+    runCmd(cmd)
+    print(("consensus sequences written to seqs.fa/.2bit in %s/ and to directory %s" % (outDir, byNameDir)))
+
+    json.dump(seqOrigin, open(join(statsDir, "fasta.json"), "w"))
+
+if "rmsk-cov" in steps:
+    # count how much of the genome is covered by each rmsk element
+    covLen = defaultdict(int)
+    for fname in glob.glob(join(allBedDir, "*.bed")):
+        repName = basename(fname).split(".")[0]
+        sizeSum = 0
+        for line in open(fname):
+            row = line.strip().split()
+            chrom, start, end = row[:3]
+            start, end = int(start), int(end)
+            size = end-start
+            sizeSum+=size
+        covLen[repName] = sizeSum
+        print("%s covers %d bp" % (repName, sizeSum))
+    json.dump(covLen, open(join(statsDir, "rmsk-cov.json"), "w"))
+
+if "strand-fa" in steps:
+    # an experiment: prep a fasta file for a normal multi aligner from the PSLs
+    cleanDirs([strandFaDir, strandBedDir])
+    rbToRm = json.load(open(join(outDir, "stats", "fasta.json")))
+    for rbName, rmSpecs in rbToRm.items():
+        print("making fasta for", rbName)
+        faName = join(strandFaDir, rbName+".fa")
+        bedFname = join(strandBedDir, rbName+".bed")
+        #catBedFname = join(blatBedGenomeDir, rbName+".bed")
+        pslFname = join(bestLiftPslDir, rbName+".psl")
+
+        cmd = "pslSwap %s stdout | pslCDnaFilter -minCover=0.25 stdin stdout | pslToBed -posName stdin %s" % (pslFname, bedFname)
+        runCmd(cmd)
+        # need -s option as aligners can't try both strands
+        cmd = "bedtools getfasta -fi /dev/shm/%s.fa -bed %s -fo %s -s" % (DB, bedFname, faName)
+        runCmd(cmd)
+
+        # append the reference for the coordinate mapping
+        refName = join(byNameDir, rbName+".fa")
+        cmd = "cat %s >> %s" % (refName, faName)
+        runCmd(cmd)
+
+if "blat-prep" in steps:
+    cleanDirs([blatBedGenomeDir, blatFaGenomeDir])
+    genomeToRam()
+    print("creating target fasta seqs, one per rb sequence")
+
+    rbToRm = json.load(open(join(outDir, "stats", "fasta.json")))
+    for rbName, rmSpecs in rbToRm.items():
+        print("making fasta for", rbName)
+        faName = join(blatFaGenomeDir, rbName+".fa")
+
+        #print("concating rmsk BEDs")
+        rmNames = [x[0] for x in rmSpecs]
+        bedFnames = [join(allBedDir, x+".bed") for x in rmNames]
+        catBedFname = join(blatBedGenomeDir, rbName+".bed")
+        cmd = "cat %s > %s" % (" ".join(bedFnames), catBedFname)
+        runCmd(cmd)
+
+        #print("getting sequences")
+        faFname = join(blatFaGenomeDir, rbName+".fa")
+        # not using -s = strand option, pslLiftSubrange can't handle the negative strand
+        cmd = "bedtools getfasta -fi /dev/shm/%s.fa -bed %s -fo %s" % (DB, catBedFname, faFname)
+        runCmd(cmd)
+
+if "blat" in steps:
+    cleanDirs([pslDir, liftPslDir, bestLiftPslDir, chainDir])
+    print("preparing blat")
+
+    hgTwoBit = "data/%s.2bit" % DB
+    hgChromSizes = "data/%s.sizes" % DB
+    twoBit = join(outDir, "seqs.2bit")
+
+    if CLUSTER:
+        jn = join(outDir, "jobList")
+        jfh = open(jn, "w")
+        print("Writing cluster jobs to %s" % jn)
+
+    for blatGenomeFa in glob.glob(join(blatFaGenomeDir, "*.fa")):
+        rbName = basename(blatGenomeFa).split(".")[0]
+        rbFaName = join(byNameDir, rbName+".fa")
+        rbFaName = abspath(rbFaName)
+        pslName = abspath(join(pslDir, rbName+".psl"))
+        liftPslName = abspath(join(liftPslDir, rbName+".psl"))
+        bestLiftPslName = abspath(join(bestLiftPslDir, rbName+".psl"))
+        chainName = abspath(join(chainDir, rbName+".chain"))
+        # params: dbFa qFa outRawPsl outLiftRawPsl bestMatchPsl outLiftOverChain hgTwoBit hgChromSizes twoBit  
+        if CLUSTER:
+            cmd = "doBlat.sh {check in exists %(rbFaName)s} {check in exists %(blatGenomeFa)s} {check out exists %(pslName)s} {check out exists %(liftPslName)s} {check out exists %(bestLiftPslName)s} {check out exists %(chainName)s} %(hgTwoBit)s %(hgChromSizes)s %(twoBit)s\n" % locals()
+            jfh.write(cmd)
+        else:
+            cmd = "doBlat.sh %(rbFaName)s %(blatGenomeFa)s %(pslName)s %(liftPslName)s %(bestLiftPslName)s %(chainName)s %(hgTwoBit)s %(hgChromSizes)s %(twoBit)s\n" % locals()
+            runCmd(cmd)
+    if CLUSTER:
+        jfh.close()
+
+    if CLUSTER:
+        batchDir = outDir
+        cdw = os.getcwd()
+        cmd = "ssh ku 'cd %(cdw)s; para -batch=%(batchDir)s resetCounts; para -batch=%(batchDir)s clearSickNodes; para -batch=%(batchDir)s make jobList'" % locals()
+        runCmd(cmd)
+
+if "blat-cat" in steps:
+    if not isdir(liftDir):
+        os.makedirs(liftDir) # to not zap this dir, as we accumulate, hg19+hg38, in there
+    cmd = "cat %s/*  > lift/%s.raw.psl" % (liftPslDir, liftBaseName)
+    runCmd(cmd)
+
+    fnames = glob.glob(join(bestLiftPslDir, "*.psl"))
+    liftItems = {}
+    for fname in fnames:
+        repName = basename(fname).split(".")[0]
+        liftItems[repName] = len(open(fname).read().splitlines())
+    json.dump(liftItems, open(join(statsDir, "blat-cat.json"), "w"))
+
+    cmd = "cat %s/*  > %s/%s.over.psl" % (bestLiftPslDir, liftDir, liftBaseName)
+    runCmd(cmd)
+    cmd = "cat %s/* > %s/%s.over.chain" % (chainDir, liftDir, liftBaseName)
+    runCmd(cmd)
+    print("raw psls concatted to %s/%s.raw.psl" % (liftDir, liftBaseName))
+    print("best psls concatted to %s/%s.over.psl" % (liftDir, liftBaseName))
+    print("chains concatted to %s/%s.over.chain" % (liftDir, baseName))
+
+if "html" in steps:
+    # convert alignments in fa to html
+    sizes = chromSizesFname
+    db = DB
+    for alnName in glob.glob(join(prettyAlnDir, "*.fa")):
+        repName = basename(alnName).split(".")[0]
+        htmlName = join(htmlDir, repName+".html")
+        cmd = "faToMaf --html %(alnName)s %(htmlName)s -t colon --oneDb %(db)s -s %(sizes)s -d %(db)s" % locals()
+        print(cmd)
+        runCmd(cmd)
+
+#if "sizes" in steps:
+#    # create seqs/sizes directory, one file per repeat, with the length of all repeats in genome
+#    if isdir(sizeDir):
+#        runCmd("rm -rf %s" % sizeDir)
+#    os.makedirs(sizeDir)
+#
+#    for fname in glob.glob(allBedDir+"/*.bed"):
+#        outFname = join(sizeDir, basename(fname).replace(".bed", ".txt"))
+#        print((fname, outFname))
+#        ofh = open(outFname, "w")
+#        for line in open(fname):
+#            row = line.strip().split()
+#            chrom, start, end = row[:3]
+#            start, end = int(start), int(end)
+#            size = end-start
+#            ofh.write(str(size)+"\n")
+#        ofh.close()
+
+if "hist2" in steps:
+    if isdir(histDir):
+        runCmd("rm -rf %s" % histDir)
+    os.makedirs(histDir)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib import colors
+    from matplotlib.ticker import PercentFormatter
+    # Fixing random state for reproducibility
+    np.random.seed(19680801)
+
+    if len(sys.argv)==3:
+        repNames = [sys.argv[2]]
+    else:
+        repNames = open(join(outDir, "repnames.txt")).read().splitlines()
+
+    for repName in repNames:
+        print(repName)
+        fname = join(sizeDir, repName+".txt")
+        sizes = [int(x) for x in open(fname).read().splitlines()]
+        if len(sizes)<1000:
+            print(("Skipping %s. not more than 1000 copies" % repName))
+            continue
+        plt.rcParams["figure.figsize"] = (10,5)
+        fig, axs = plt.subplots(1, 1, sharey=True, tight_layout=True)
+        n_bins = 100
+        axs.set_title(repName+" length dist. (%d elements)" % len(sizes))
+        axs.set_xlabel("basepairs")
+        axs.hist(sizes, bins=n_bins)
+        #axs[0].set_title(repName+" length dist. (%d elements)" % len(sizes))
+        #axs[0].set_xlabel("basepairs")
+        #axs[0].hist(sizes, bins=n_bins)
+        #axs[1].set_title(repName+" length distribution (zoomed)")
+        #axs[1].set_xlabel("basepairs")
+        #axs[1].hist(sizes, bins=n_bins, range=(2000, 7000))
+
+        figName = join(histDir, repName+".png")
+        plt.savefig(figName)
+        plt.close()
+
+if "summary" in steps:
+    # building summary table
+    repCounts = json.load(open(join(statsDir, "allbed.json"))) # dict: name to number of copies
+    topBed = json.load(open(join(statsDir, "topbed.json"))) # name to dict: lens, targetLen, topLen
+    consData = json.load(open(join(statsDir, "cons.json"))) # name to dict: alnLen, consLen, nCount, ratio
+    rbToRms = json.load(open(join(statsDir, "fasta.json")))
+    liftItems = json.load(open(join(statsDir, "blat-cat.json")))
+    featBitCov = json.load(open(join(statsDir, "blat-rawbest.json")))
+    genomeCov = json.load(open(join(statsDir, "rmsk-cov.json")))
+
+    ofh = open(join(outDir, "summary.tsv"), "w")
+    ofh.write("\t".join(["repBrowserName", "RmskNames", "SumCopiesInGenome", "SepCopiesInGenome", "LiftableCopies", "SeqSources", "99%Length", "maxLenInGenome", "consLen", "consNCount", "consRatio", "rmskCov", "covRawBlat", "covBestBlat", "ratio_bestToRaw", "ratio_bestToRmsk"]))
+    ofh.write("\n")
+
+    for rbName, rmData in rbToRms.items():
+        rmNames = [x[0] for x in rmData]
+        rmNameStr = ",".join(rmNames)
+        comments = ",".join([x[1] for x in rmData])
+        repCountList = [repCounts[rn] for rn in rmNames]
+        totalRepCount = sum(repCountList)
+        repCountStr = ",".join([str(rc) for rc in repCountList])
+        lenData, targetLen, maxLen = "-", "-", "-"
+        if rbName in consData:
+            alnData = consData[rbName]
+            alnLen = alnData["alnLen"]
+            #consLen = alnData["consLen"]
+            nCount = alnData["nCount"]
+            ratio = alnData["ratio"]
+            if rbName in topBed:
+                lenData = topBed[rbName]
+                targetLen = lenData["targetLen"]
+                maxLen = max(lenData["lens"])
+        else:
+            alnLen = "-1"
+            consLen = "-1"
+            nCount = "-1"
+            ratio = "-1"
+
+        covRaw = None
+        covBest = None
+        covRatio = None
+        if rbName in featBitCov["raw"]:
+            covRaw = featBitCov["raw"][rbName]
+        if rbName in featBitCov["best"]:
+            covBest = featBitCov["best"][rbName]
+        if covRaw and covBest:
+            covRatio = covBest/covRaw
+
+        rmskCov = 0
+        rmskRatio = "-1"
+        for rmName in rmNames:
+            rmskCov += genomeCov[rmName]
+        if covBest:
+            rmskRatio = covBest/rmskCov 
+
+        liftCount = liftItems[rbName]
+        row = [rbName, rmNameStr, totalRepCount, repCountStr, liftCount, comments, targetLen, maxLen, alnLen, nCount, ratio, rmskCov, covRaw, covBest, covRatio, rmskRatio]
+        row = [str(x) for x in row]
+        ofh.write("\t".join(row))
+        ofh.write("\n")
+    print("Wrote %s" % ofh.name)
+
+# get raw vs best coverage
+if "blat-rawbest" in steps:
+    if not isdir("temp"):
+        os.makedirs("temp")
+    cleanDirs([featbitsDir])
+    for fname in glob.glob(join(bestLiftPslDir, "*.psl")):
+        repName = basename(fname).split(".")[0]
+        bestFname = join(featbitsDir, repName+".best.txt")
+        cmd = "pslSwap %s temp/swap.psl && featureBits %s temp/swap.psl 2> %s" % (fname, DB, bestFname)
+        runCmd(cmd)
+
+        base = basename(fname)
+        rawFname = join(featbitsDir, repName+".raw.txt")
+        cmd = "pslSwap %s/%s temp/swap.psl && featureBits %s temp/swap.psl 2> %s" % (liftPslDir, base, DB, rawFname)
+        runCmd(cmd)
+
+# cat raw vs best:
+if "blat-rawbest-cat" in steps:
+    rawCov = {}
+    bestCov = {}
+    for fname in glob.glob(join(featbitsDir, "*.txt")):
+        repName = basename(fname).split(".")[0]
+        print(fname)
+        data = open(fname).read()
+        if "is empty" in data:
+            print("%s contains is empty" % fname)
+            continue
+        cov = int(data.split()[0])
+        if ".raw." in fname:
+            rawCov[repName]=cov
+        else:
+            bestCov[repName]=cov
+    cov = {}
+    cov["raw"] = rawCov
+    cov["best"] = bestCov
+    ofname = join(statsDir, "blat-rawbest.json")
+    json.dump(cov, open(ofname, "w"))
+    print("Wrote "+ofname)
+
+# a simple track with details about how the sequence was built
+if "t-build" in steps:
+    if not isdir(trackDir):
+        os.makedirs(trackDir)
+
+    DFAMFIELDCOUNT = 4
+    dfamData = {}
+    for line in open(dfamTsv):
+        row = line.rstrip("\n").split("\t")[:5]
+        repName, repType, repClass, org, comment = row
+        dfamData[repName] = (repType, repClass, org, comment)
+
+    bedFname = join(trackDir, "build.bed")
+    ofh = open(bedFname, "w")
+
+    chromSizes = join(outDir, "chrom.sizes")
+    sizes = {}
+    for line in open(chromSizes):
+        row = line.rstrip("\n").split("\t")
+        sizes[row[0]]= int(row[1])
+
+    summData = {}
+    for line in open(join(outDir, "summary.tsv")):
+        row = line.rstrip("\n").split("\t")
+        if row[0]=="repBrowserName":
+            continue
+        summData[row[0]] = row
+
+    for rbName, summData in summData.items():
+        rbName, rmNameStr, totalRepCount, repCountStr, liftCount, comments, targetLen, maxLen, alnLen, nCount, ratio = summData
+        rbSize = sizes[rbName]
+        bed12 = [rbName, "0", rbSize, rbName, "0", ".", "0", rbSize, "0", "1", rbSize, "0"]
+        bed12 = [str(x) for x in bed12]
+
+        dfamName = rbName
+        if dfamName not in dfamData:
+            if rbName+"_3end" in dfamData:
+                dfamName = rbName+"_3end"
+            if rbName+"_5end" in dfamData:
+                dfamName = rbName+"_5end"
+
+        extras = []
+        if dfamName in dfamData:
+            extras.extend([rbName, dfamName])
+            extras.extend(dfamData[dfamName])
+        else:
+            extras = ["not found"]*(DFAMFIELDCOUNT+2)
+
+        extras.extend([rmNameStr, totalRepCount, repCountStr, liftCount, comments, targetLen, maxLen, alnLen, nCount, ratio])
+
+        assert(len(bed12)==12)
+        assert(len(extras)==16)
+
+        ofh.write("\t".join(bed12))
+        ofh.write("\t")
+        ofh.write("\t".join(extras))
+        ofh.write("\n")
+    ofh.close()
+    print("wrote %s" % ofh.name)
+
+    cmd = "bedSort %s %s" % (ofh.name, ofh.name)
+    runCmd(cmd)
+
+    bbName = HUBDIR+"/build.bb"
+    cmd = "bedToBigBed -tab -as=data/build.as %s %s %s -type=bed12+" % (ofh.name, chromSizes, bbName)
+    runCmd(cmd)
+    os.remove(ofh.name)
+
+# coverage of genome lift file
+if "t-liftcov" in steps:
+    print("coverage of liftOver")
+    if not isdir("temp"):
+        os.makedirs("temp")
+    if not isdir(repTrackDir):
+        os.makedirs(repTrackDir)
+    runCmd("pslToBed %s/%s.over.psl temp/liftcov.bed -posName" % (liftDir, liftBaseName))
+    runCmd("genomeCoverageBed -i temp/liftcov.bed -split -g %s -bg > temp/liftcov.bg" % (repSizesFname))
+    runCmd("bedSort temp/liftcov.bg temp/liftcov.bg")
+    runCmd("bedGraphToBigWig temp/liftcov.bg %s %s/liftOverCoverage.bw" % (repSizesFname, repTrackDir))
